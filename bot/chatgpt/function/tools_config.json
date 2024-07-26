@@ -1,0 +1,24 @@
+[
+    {
+        "type": "function",
+        "function": {
+            "name": "search_bing",
+            "description": "Search the web using Bing",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query"
+                    },
+                    "mkt": {
+                        "type": "string",
+                        "description": "The market code, e.g. zh-CN",
+                        "default": "zh-CN"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    }
+]
