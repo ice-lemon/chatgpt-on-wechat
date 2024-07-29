@@ -1,6 +1,7 @@
 [
     {
         "type": "function",
+        "name": "search_bing",
         "function": {
             "name": "search_bing",
             "description": "Search the web using Bing",

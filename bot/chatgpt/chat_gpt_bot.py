@@ -1,13 +1,9 @@
 # encoding:utf-8
-
 import json
-from calendar import c
 import time
-
 import openai
 import openai.error
 import requests
-
 from bot.bot import Bot
 from bot.chatgpt.chat_gpt_session import ChatGPTSession
 from bot.openai.open_ai_image import OpenAIImage
@@ -17,10 +13,10 @@ from bridge.reply import Reply, ReplyType
 from common.log import logger
 from common.token_bucket import TokenBucket
 from config import conf, load_config
-from function.bing_search import search_bing
+from bot.chatgpt.function.bing_search import search_bing
 
 # 加载 tools_config.json
-with open("function/tools_config.json", "r") as f:
+with open("./bot/chatgpt/function/tools_config.json", "r") as f:
     tools_config = json.load(f)
 
 # 创建一个字典，将函数名映射到函数对象
@@ -29,8 +25,6 @@ available_functions = {
     for tool in tools_config
     if tool["type"] == "function"
 }
-
-
 
 # OpenAI对话模型API (可用)
 class ChatGPTBot(Bot, OpenAIImage):
@@ -81,20 +75,14 @@ class ChatGPTBot(Bot, OpenAIImage):
             logger.debug("[CHATGPT] session query={}".format(session.messages))
 
             api_key = context.get("openai_api_key")
-            bing_subscription_key = context.get("bing_subscription_key")
             model = context.get("gpt_model")
             new_args = None
             if model:
                 new_args = self.args.copy()
                 new_args["model"] = model
 
-            # 使用function calling
-            if bing_subscription_key:
-                reply_content = self.reply_with_function_calling(
-                    session, api_key, bing_subscription_key, args=new_args
-                )
-            else:
-                reply_content = self.reply_text(session, api_key, args=new_args)
+            # 使用 function calling
+            reply_content = self.reply_with_function_calling(session, api_key, args=new_args)
 
             logger.debug(
                 "[CHATGPT] new_query={}, session_id={}, reply_cont={}, completion_tokens={}".format(
@@ -125,28 +113,73 @@ class ChatGPTBot(Bot, OpenAIImage):
         else:
             reply = Reply(ReplyType.ERROR, "Bot不支持处理{}类型的消息".format(context.type))
             return reply
-    def reply_text(self, session: ChatGPTSession, api_key=None, args=None, retry_count=0) -> dict:
+
+    def reply_with_function_calling(self, session: ChatGPTSession, api_key=None, args=None, retry_count=0) -> dict:
         """
-        call openai's ChatCompletion to get the answer
-        :param session: a conversation session
-        :param session_id: session id
-        :param retry_count: retry count
-        :return: {}
+        使用 OpenAI 的 Function Calling 功能进行回复
         """
         try:
             if conf().get("rate_limit_chatgpt") and not self.tb4chatgpt.get_token():
                 raise openai.error.RateLimitError("RateLimitError: rate limit exceeded")
-            # if api_key == None, the default openai.api_key will be used
             if args is None:
                 args = self.args
-            response = openai.ChatCompletion.create(api_key=api_key, messages=session.messages, **args)
-            # logger.debug("[CHATGPT] response={}".format(response))
-            # logger.info("[ChatGPT] reply={}, total_tokens={}".format(response.choices[0]['message']['content'], response["usage"]["total_tokens"]))
-            return {
-                "total_tokens": response["usage"]["total_tokens"],
-                "completion_tokens": response["usage"]["completion_tokens"],
-                "content": response.choices[0]["message"]["content"],
-            }
+            response = openai.ChatCompletion.create(
+                api_key=api_key,
+                messages=session.messages,
+                tools=tools_config,
+                tool_choice="auto",
+                **args,
+            )
+            response_message = response["choices"][0]["message"]
+
+            # 检查模型是否想调用函数
+            if function_call := response_message.get("tool_calls"):
+                for call in function_call:
+                    function_name = call["function"]['name']
+                    function_args = call["function"]["arguments"]
+
+                    function_args = json.loads(function_args)
+                    # 调用函数
+                    if function_name in available_functions:
+                        function_to_call = available_functions[function_name]
+                        if function_name == "search_bing":
+                            bing_subscription_key=conf().get("bing_subscription_key")
+                            function_args["bing_subscription_key"] = bing_subscription_key
+                        function_response = function_to_call(**function_args)
+
+                        # 将函数结果添加到消息历史中
+                        session.messages.append(
+                            {
+                                "role": "function",
+                                "name": function_name,
+                                "content": json.dumps(function_response),
+                            }
+                        )
+
+                        # 递归调用，让模型根据函数结果生成最终回复
+                        return self.reply_with_function_calling(session, api_key, args, retry_count)
+                    else:
+                        return {
+                            "total_tokens": 0,
+                            "completion_tokens": 0,
+                            "content": f"错误：函数 '{function_name}' 未找到。",
+                        }
+            else:
+                # 模型没有调用函数，直接返回回复
+                return {
+                    "total_tokens": response["usage"]["total_tokens"],
+                    "completion_tokens": response["usage"]["completion_tokens"],
+                    "content": response_message["content"],
+                }
+
+        except openai.error.RateLimitError as e:
+            # rate limit error, sleep and retry
+            if retry_count < conf().get("retry_count", 0):
+                logger.warn(f"[CHATGPT] RateLimitError: {e}, retrying in {conf().get('retry_delay', 10)} seconds")
+                time.sleep(conf().get('retry_delay', 10))
+                return self.reply_with_function_calling(session, api_key, bing_subscription_key, args, retry_count + 1)
+            else:
+                raise e
         except Exception as e:
             need_retry = retry_count < 2
             result = {"completion_tokens": 0, "content": "我现在有点累了，等会再来吧"}
@@ -177,104 +210,11 @@ class ChatGPTBot(Bot, OpenAIImage):
 
             if need_retry:
                 logger.warn("[CHATGPT] 第{}次重试".format(retry_count + 1))
-                return self.reply_text(session, api_key, args, retry_count + 1)
+                return self.reply_with_function_calling(session, api_key, bing_subscription_key, args, retry_count + 1)
             else:
                 return result
-    def reply_with_function_calling(self, session: ChatGPTSession, api_key=None, bing_subscription_key=None, args=None, retry_count=0) -> dict:
-            """
-            使用 OpenAI 的 Function Calling 功能进行回复
-            """
-            try:
-                if conf().get("rate_limit_chatgpt") and not self.tb4chatgpt.get_token():
-                    raise openai.error.RateLimitError("RateLimitError: rate limit exceeded")
-                if args is None:
-                    args = self.args
-                response = openai.ChatCompletion.create(
-                    api_key=api_key,
-                    messages=session.messages,
-                    functions=tools_config,
-                    **args,
-                )
-                response_message = response["choices"][0]["message"]
 
-                # 检查模型是否想调用函数
-                if function_call := response_message.get("function_call"):
-                    function_name = function_call["name"]
-                    function_args = json.loads(function_call["arguments"])
 
-                    # 调用函数
-                    if function_name in available_functions:
-                        function_to_call = available_functions[function_name]
-                        if function_name == "search_bing":
-                            function_args["bing_subscription_key"] = bing_subscription_key
-                        function_response = function_to_call(**function_args)
-
-                        # 将函数结果添加到消息历史中
-                        session.messages.append(
-                            {
-                                "role": "function",
-                                "name": function_name,
-                                "content": json.dumps(function_response),
-                            }
-                        )
-
-                        # 递归调用，让模型根据函数结果生成最终回复
-                        return self.reply_with_function_calling(session, api_key, bing_subscription_key, args, retry_count)
-                    else:
-                        return {
-                            "total_tokens": 0,
-                            "completion_tokens": 0,
-                            "content": f"错误：函数 '{function_name}' 未找到。",
-                        }
-                else:
-                    # 模型没有调用函数，直接返回回复
-                    return {
-                        "total_tokens": response["usage"]["total_tokens"],
-                        "completion_tokens": response["usage"]["completion_tokens"],
-                        "content": response_message["content"],
-                    }
-
-            except openai.error.RateLimitError as e:
-                # rate limit error, sleep and retry
-                if retry_count < conf().get("retry_count", 0):
-                    logger.warn(f"[CHATGPT] RateLimitError: {e}, retrying in {conf().get('retry_delay', 10)} seconds")
-                    time.sleep(conf().get("retry_delay", 10))
-                    return self.reply_with_function_calling(session, api_key, bing_subscription_key, args, retry_count + 1)
-                else:
-                    raise e
-            except Exception as e:
-                need_retry = retry_count < 2
-                result = {"completion_tokens": 0, "content": "我现在有点累了，等会再来吧"}
-                if isinstance(e, openai.error.RateLimitError):
-                    logger.warn("[CHATGPT] RateLimitError: {}".format(e))
-                    result["content"] = "提问太快啦，请休息一下再问我吧"
-                    if need_retry:
-                        time.sleep(20)
-                elif isinstance(e, openai.error.Timeout):
-                    logger.warn("[CHATGPT] Timeout: {}".format(e))
-                    result["content"] = "我没有收到你的消息"
-                    if need_retry:
-                        time.sleep(5)
-                elif isinstance(e, openai.error.APIError):
-                    logger.warn("[CHATGPT] Bad Gateway: {}".format(e))
-                    result["content"] = "请再问我一次"
-                    if need_retry:
-                        time.sleep(10)
-                elif isinstance(e, openai.error.APIConnectionError):
-                    logger.warn("[CHATGPT] APIConnectionError: {}".format(e))
-                    result["content"] = "我连接不到你的网络"
-                    if need_retry:
-                        time.sleep(5)
-                else:
-                    logger.exception("[CHATGPT] Exception: {}".format(e))
-                    need_retry = False
-                    self.sessions.clear_session(session.session_id)
-
-                if need_retry:
-                    logger.warn("[CHATGPT] 第{}次重试".format(retry_count + 1))
-                    return self.reply_with_function_calling(session, api_key,bing_subscription_key, args, retry_count + 1)
-                else:
-                    return result
 
 class AzureChatGPTBot(ChatGPTBot):
     def __init__(self):
